@@ -11,3 +11,4 @@ opt-level = 3
 
 [dependencies]
 ffmpeg-next = "7.1.0"
+rusttype = "0.9.3"
