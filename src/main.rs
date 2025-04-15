@@ -1,37 +1,54 @@
-use std::time::Instant;
+use std::{ffi::c_int, time::Instant};
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::sws_scale, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
+    f_w: usize,
+    f_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    r_w: usize,
+    r_h: usize,
     x: Vec<usize>,
     y: Vec<usize>,
 }
 
 impl RenderData {
-    fn new(r_w: u32, r_h: u32, f_w: u32, f_h: u32) -> Self {
+    fn new(r_w: u32, r_h: u32, dst_w: u32, dst_h: u32, f_w: u32, f_h: u32) -> Self {
         Self {
-            x: (0..r_w).map(|x| (x * f_w) as usize).collect(),
-            y: (0..r_h).map(|x| (x * f_h) as usize).collect(),
+            f_w: f_w as usize,
+            f_h: f_h as usize,
+            r_w: r_w as usize,
+            r_h: r_h as usize,
+            dst_w: dst_w as usize,
+            dst_h: dst_h as usize,
+            x: (0..r_w).map(|x| (x as f32 * dst_w as f32 / r_w as f32) as usize).collect(),
+            y: (0..r_h).map(|x| (x as f32 * dst_h as f32 / r_h as f32) as usize).collect(),
         }
     }
 }
 
-struct NominalData {
-    w: usize,
-    h: usize,
-    font_w: usize,
-    _font_h: usize,
-}
-
-fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, scaler: &mut Context, char_set: &[Vec<Vec<u8>>], render_data: &RenderData, nom_data: &NominalData, template: &frame::Video) {
+fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, scaler: &mut Context, char_set: &[Vec<Vec<u8>>], render_data: &RenderData, template: &frame::Video) {
     let mut frame = frame::Video::empty();
     let lum_to_char = char_set.len() as f32 / 256.;
     while decoder.receive_frame(&mut frame).is_ok() {
-        let mut scaled_frame = frame::Video::empty();
-        scaler.run(&frame, &mut scaled_frame).unwrap();
+        // Scale frame to render resolution
+        let mut scaled_frame = frame::Video::new(Pixel::GRAY8, render_data.r_w as u32, render_data.r_h as u32);
+        unsafe {
+            sws_scale(
+                scaler.as_mut_ptr(),
+                (*frame.as_ptr()).data.as_ptr() as *const *const _,
+                (*frame.as_ptr()).linesize.as_ptr() as *const _,
+                0,
+                frame.height() as c_int,
+                (*scaled_frame.as_mut_ptr()).data.as_ptr(),
+                [render_data.r_w, 0, 0, 0, 0, 0, 0, 0].as_ptr() as *mut _,
+            );
+        }
         let luminosity = scaled_frame.data_mut(0);
 
+        // Render characters on to output frame
         let mut new_frame = template.clone();
         let bytes = new_frame.data_mut(0);
         let mut i = 0;
@@ -40,10 +57,10 @@ fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, sca
                 let char_index = luminosity[i] as f32 * lum_to_char;
                 let stamp = &char_set[char_index as usize];
 
-                for (char_y, line) in stamp.iter().enumerate() {
-                    let start = x + (y + char_y)*nom_data.w;
-                    let end = start + nom_data.font_w;
-                    bytes[start..end].copy_from_slice(line);
+                let mut start = x + y*render_data.dst_w;
+                for line in stamp {
+                    bytes[start..(start + render_data.f_w)].copy_from_slice(line);
+                    start += render_data.dst_w;
                 }
                 i += 1;
             }
@@ -110,11 +127,12 @@ fn main() {
     let src = "src.mp4";
     let dst = "dst.mp4";
     let dst_h = 1080;
-    let render_h = 40;
+    let render_h = 10;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
     let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
 
     let start_t = Instant::now();
+    ffmpeg_the_third::init().unwrap();
 
     // Input
     let mut in_ctx = format::input(src).unwrap();
@@ -141,10 +159,12 @@ fn main() {
     
     // Font
     let (font_w, char_set) = construct_char_set(font_path, char_set, font_h);
+    println!("{}",font_w);
     let render_w = dst_w / font_w;
 
     // Output
     let mut out_ctx = format::output(dst).unwrap();
+    let global_header = out_ctx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
     // Creates output stream
     let codec = encoder::find(codec::Id::H264).expect("Couldn't find encoding codec");
@@ -166,6 +186,10 @@ fn main() {
     x264_opts.set("preset", "veryslow");
     x264_opts.set("crf", "0");
 
+    if global_header {
+        encoder.set_flags(codec::Flags::GLOBAL_HEADER);
+    }
+
     let mut encoder = encoder
         .open_with(x264_opts)
         .expect("error opening x264 with supplied settings");
@@ -178,7 +202,7 @@ fn main() {
     let mut scaler = Context::get(
         src_fmt,
         src_w, src_h,
-        dst_fmt,
+        Pixel::GRAY8,
         render_w, render_h,
         Flags::FAST_BILINEAR,
     ).unwrap();
@@ -186,25 +210,24 @@ fn main() {
     out_ctx.set_metadata(in_ctx.metadata().to_owned());
     out_ctx.write_header().unwrap();
     
-    let render_data = RenderData::new(render_w, render_h, font_w, font_h);
+    let render_data = RenderData::new(render_w, render_h, dst_w, dst_h, font_w, font_h);
     println!("{}, {}", render_data.x.len(), render_data.y.len());
     println!("{:?}", render_data.x);
     println!("{:?}", render_data.y);
-    let nom_data = NominalData {w: dst_w as usize, h: dst_h as usize, font_w: font_w as usize, _font_h: font_h as usize};
-    let mut template = frame::Video::new(Pixel::YUV420P, nom_data.w as u32, nom_data.h as u32);
+    let mut template = frame::Video::new(dst_fmt, dst_w, dst_h);
     template.data_mut(1).fill(127);
     template.data_mut(2).fill(127);
     for (stream, packet) in in_ctx.packets().filter_map(Result::ok) {
         if stream.index() == in_stream_index {
             decoder.send_packet(&packet).unwrap();
         }
-        decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &nom_data, &template);
+        decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
         encode_frames(&mut encoder, out_stream_index, in_time_base, out_time_base, &mut out_ctx);
     }
 
     // Close file
     decoder.send_eof().unwrap();
-    decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &nom_data, &template);
+    decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
     encoder.send_eof().unwrap();
     encode_frames(&mut encoder, out_stream_index, in_time_base, out_time_base, &mut out_ctx);
     out_ctx.write_trailer().unwrap();
@@ -215,12 +238,3 @@ fn main() {
     let elapsed_time = start_t.elapsed();
     println!("Took {} seconds.", elapsed_time.as_secs_f32());
 }
-
-
-// determine pixel format
-// rasterize font glyphs into bytes, based on pixel format
-// get mut byte data
-// filter src --> glyph indexes
-// create frame from scratch, adding glyph data
-// encode
-//fix frame rate issue
