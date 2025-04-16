@@ -1,6 +1,6 @@
-use std::{ffi::c_int, time::Instant};
+use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::{av_opt_set, av_opt_set_int}, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
@@ -48,10 +48,10 @@ fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, sca
                 let char_index = luminosity[i] as f32 * lum_to_char;
                 let stamp = &char_set[char_index as usize];
 
-                let mut start = x + y*render_data.dst_w;
+                let mut start = x + y*template.stride(0);
                 for line in stamp {
                     bytes[start..(start + render_data.f_w)].copy_from_slice(line);
-                    start += render_data.dst_w;
+                    start += template.stride(0);
                 }
                 i += 1;
             }
@@ -100,11 +100,14 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 
     // Render characters
     let mut glyph_bytes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(glyphs.len());
-    for glyph in glyphs {
+    let scale = Scale::uniform(font_h as f32 * adj_factor);
+    let v_metrics = font.v_metrics(scale);
+    for c in chars.chars() {
+        let glyph = font.glyph(c).scaled(scale).positioned(point(0., v_metrics.ascent));
         let mut bytes = vec![vec![0; glyphs_width as usize]; glyphs_height as usize];
         if let Some(bounding_box) = glyph.pixel_bounding_box() {
-            let x_pad = (glyphs_width - bounding_box.width() as u32) / 2;
-            let y_pad = (glyphs_height - bounding_box.height() as u32) / 2;
+            let x_pad = (glyphs_width - bounding_box.width() as u32) >> 1;
+            let y_pad = (glyphs_height - bounding_box.height() as u32) >> 1;
             glyph.draw(|x, y, v| {
                 bytes[(y + y_pad) as usize][(x + x_pad) as usize] = (v * 256.) as u8;
             });
@@ -118,8 +121,8 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 fn main() {
     let src = "src.mp4";
     let dst = "dst.mp4";
-    let dst_h = 1080;
-    let render_h = 80;
+    let mut dst_h = 360;
+    let render_h = 10;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
     let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
 
@@ -145,13 +148,14 @@ fn main() {
     // Relevant data
     let src_w = decoder.width();
     let src_h = decoder.height();
-    let dst_w = dst_h * src_w / src_h;
+    let mut dst_w = dst_h * src_w / src_h;
+    dst_w -= dst_w % 2;
+    dst_h -= dst_h % 2;
     let font_h = dst_h / render_h;
     let src_fmt = decoder.format();
     
     // Font
     let (font_w, char_set) = construct_char_set(font_path, char_set, font_h);
-    println!("{}",font_w);
     let render_w = dst_w / font_w;
 
     // Output
@@ -165,6 +169,7 @@ fn main() {
     let out_stream_index = out_stream.index();
 
     // Creates encoder
+    println!("{}, {}",dst_w, dst_h);
     let mut encoder = codec::context::Context::new_with_codec(codec)
         .encoder().video().unwrap();
     encoder.set_width(dst_w);
@@ -175,6 +180,7 @@ fn main() {
     encoder.set_time_base(in_time_base);
     
     let mut x264_opts = Dictionary::new();
+    // x264_opts.set("profile", "high");
     x264_opts.set("preset", "veryslow");
     x264_opts.set("crf", "0");
 
@@ -182,6 +188,13 @@ fn main() {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
+    encoder.set_bit_rate(10000000);
+
+    // unsafe {
+    //     av_opt_set((*(encoder.as_mut_ptr())).priv_data, "profile".as_ptr() as *const _, "high".as_ptr() as *const _, 0);
+    //     av_opt_set((*(encoder.as_mut_ptr())).priv_data, "preset".as_ptr() as *const _, "veryslow".as_ptr() as *const _, 0);
+    //     av_opt_set_int((*(encoder.as_mut_ptr())).priv_data, "crf".as_ptr() as *const _, 0, 0);
+    // }
     let mut encoder = encoder
         .open_with(x264_opts)
         .expect("error opening x264 with supplied settings");
@@ -230,3 +243,5 @@ fn main() {
     let elapsed_time = start_t.elapsed();
     println!("Took {} seconds.", elapsed_time.as_secs_f32());
 }
+
+// fix compression issues
