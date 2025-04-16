@@ -1,6 +1,6 @@
 use std::{ffi::c_int, time::Instant};
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::sws_scale, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
@@ -35,17 +35,8 @@ fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, sca
     while decoder.receive_frame(&mut frame).is_ok() {
         // Scale frame to render resolution
         let mut scaled_frame = frame::Video::new(Pixel::GRAY8, render_data.r_w as u32, render_data.r_h as u32);
-        unsafe {
-            sws_scale(
-                scaler.as_mut_ptr(),
-                (*frame.as_ptr()).data.as_ptr() as *const *const _,
-                (*frame.as_ptr()).linesize.as_ptr() as *const _,
-                0,
-                frame.height() as c_int,
-                (*scaled_frame.as_mut_ptr()).data.as_ptr(),
-                [render_data.r_w, 0, 0, 0, 0, 0, 0, 0].as_ptr() as *mut _,
-            );
-        }
+        scaler.run(&frame, &mut scaled_frame).unwrap();
+        let padding = scaled_frame.stride(0) - render_data.r_w;
         let luminosity = scaled_frame.data_mut(0);
 
         // Render characters on to output frame
@@ -64,6 +55,7 @@ fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, sca
                 }
                 i += 1;
             }
+            i+= padding;
         }
 
         new_frame.set_pts(frame.timestamp());
@@ -127,7 +119,7 @@ fn main() {
     let src = "src.mp4";
     let dst = "dst.mp4";
     let dst_h = 1080;
-    let render_h = 10;
+    let render_h = 80;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
     let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
 
