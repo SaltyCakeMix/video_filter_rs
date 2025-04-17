@@ -77,26 +77,42 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
     let font = Font::try_from_bytes(font_path).expect("Error constructing Font");
 
     // Determines proper font scaling
+    let value_cutoff = 0.25;
     let func = |height| {
         let scale = Scale::uniform(height);
         let v_metrics = font.v_metrics(scale);
         let glyphs: Vec<_> = font.layout(chars, scale, point(0., v_metrics.ascent)).collect();
-        let glyphs_height = glyphs
-            .iter()
-            .map(|g| g.pixel_bounding_box().unwrap_or_default().height())
-            .max()
-            .unwrap() as u32;
-        (glyphs, glyphs_height)
+        let (glyphs_width, glyphs_height) = {
+            let mut top = glyphs
+                .iter()
+                .map(|g| g.pixel_bounding_box().unwrap_or_default().height())
+                .max()
+                .unwrap() as u32;
+            let mut left = glyphs
+                .iter()
+                .map(|g| g.pixel_bounding_box().unwrap_or_default().width())
+                .max()
+                .unwrap() as u32;
+            let mut bottom = 0;
+            let mut right = 0;
+            for glyph in glyphs.iter() {
+                glyph.draw(|x, y, v| {
+                    if v > value_cutoff {
+                        top = y.min(top);
+                        bottom = y.max(bottom);
+                        left = x.min(left);
+                        right = x.max(right);
+                    }
+                });
+            }
+            (right - left, bottom - top)
+        };
+        (glyphs, glyphs_width, glyphs_height)
     };
-    let (_, glyphs_height) = func(font_h as f32);
+    let (_, _, glyphs_height) = func(font_h as f32);
     let adj_factor = font_h as f32 / glyphs_height as f32;
 
-    let (glyphs, glyphs_height) = func(font_h as f32 * adj_factor);
-    let glyphs_width = glyphs
-        .iter()
-        .map(|g| g.pixel_bounding_box().unwrap_or_default().width())
-        .max()
-        .unwrap() as u32;
+    let (glyphs, glyphs_width, glyphs_height) = func(font_h as f32 * adj_factor);
 
     // Render characters
     let mut glyph_bytes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(glyphs.len());
@@ -106,10 +122,14 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
         let glyph = font.glyph(c).scaled(scale).positioned(point(0., v_metrics.ascent));
         let mut bytes = vec![vec![0; glyphs_width as usize]; glyphs_height as usize];
         if let Some(bounding_box) = glyph.pixel_bounding_box() {
-            let x_pad = (glyphs_width - bounding_box.width() as u32) >> 1;
-            let y_pad = (glyphs_height - bounding_box.height() as u32) >> 1;
+            let x_pad = (glyphs_width as i32 - bounding_box.width()) >> 1;
+            let y_pad = (glyphs_height as i32 - bounding_box.height()) >> 1;
             glyph.draw(|x, y, v| {
-                bytes[(y + y_pad) as usize][(x + x_pad) as usize] = (v * 256.) as u8;
+                let x_i = x as i32 + x_pad;
+                let y_i = y as i32 + y_pad;
+                if x > 0 && x < glyphs_width && y > 0 && y < glyphs_height {
+                    bytes[y_i as usize][x_i as usize] = (v > value_cutoff) as u8 * 255;
+                }
             });
         }
         glyph_bytes.push(bytes);
@@ -121,8 +141,8 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 fn main() {
     let src = "src.mp4";
     let dst = "dst.mp4";
-    let mut dst_h = 360;
-    let render_h = 10;
+    let mut dst_h = 1080;
+    let render_h = 60;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
     let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
 
@@ -178,25 +198,15 @@ fn main() {
     encoder.set_format(Pixel::YUV420P);
     encoder.set_frame_rate(Some(in_stream.avg_frame_rate()));
     encoder.set_time_base(in_time_base);
+    encoder.set_bit_rate(25000000);
+    encoder.set_max_bit_rate(50000000);
     
-    let mut x264_opts = Dictionary::new();
-    // x264_opts.set("profile", "high");
-    x264_opts.set("preset", "veryslow");
-    x264_opts.set("crf", "0");
-
     if global_header {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
-    encoder.set_bit_rate(10000000);
-
-    // unsafe {
-    //     av_opt_set((*(encoder.as_mut_ptr())).priv_data, "profile".as_ptr() as *const _, "high".as_ptr() as *const _, 0);
-    //     av_opt_set((*(encoder.as_mut_ptr())).priv_data, "preset".as_ptr() as *const _, "veryslow".as_ptr() as *const _, 0);
-    //     av_opt_set_int((*(encoder.as_mut_ptr())).priv_data, "crf".as_ptr() as *const _, 0, 0);
-    // }
     let mut encoder = encoder
-        .open_with(x264_opts)
+        .open()
         .expect("error opening x264 with supplied settings");
     out_stream.set_parameters(Parameters::from(&encoder));
     
