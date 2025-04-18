@@ -1,13 +1,11 @@
 use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::{av_opt_set, av_opt_set_int}, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, format::{self, Pixel}, frame, software::scaling::{Context, Flags}, Packet, Rational, media};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
     f_w: usize,
-    f_h: usize,
-    dst_w: usize,
-    dst_h: usize,
+    _f_h: usize,
     r_w: usize,
     r_h: usize,
     x: Vec<usize>,
@@ -18,11 +16,9 @@ impl RenderData {
     fn new(r_w: u32, r_h: u32, dst_w: u32, dst_h: u32, f_w: u32, f_h: u32) -> Self {
         Self {
             f_w: f_w as usize,
-            f_h: f_h as usize,
+            _f_h: f_h as usize,
             r_w: r_w as usize,
             r_h: r_h as usize,
-            dst_w: dst_w as usize,
-            dst_h: dst_h as usize,
             x: (0..r_w).map(|x| (x as f32 * dst_w as f32 / r_w as f32) as usize).collect(),
             y: (0..r_h).map(|x| (x as f32 * dst_h as f32 / r_h as f32) as usize).collect(),
         }
@@ -45,8 +41,8 @@ fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, sca
         let mut i = 0;
         for y in render_data.y.iter() {
             for x in render_data.x.iter() {
-                let char_index = luminosity[i] as f32 * lum_to_char;
-                let stamp = &char_set[char_index as usize];
+                let char_idx = luminosity[i] as f32 * lum_to_char;
+                let stamp = &char_set[char_idx as usize];
 
                 let mut start = x + y*template.stride(0);
                 for line in stamp {
@@ -63,11 +59,11 @@ fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, sca
     }
 }
 
-fn encode_frames(encoder: &mut encoder::Video, out_stream_index: usize, in_time_base: Rational, out_time_base: Rational, out_ctx: &mut format::context::Output) {
+fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid_tb: Rational, out_vid_tb: Rational, out_ctx: &mut format::context::Output) {
     let mut encoded = Packet::empty();
     while encoder.receive_packet(&mut encoded).is_ok() {
-        encoded.set_stream(out_stream_index);
-        encoded.rescale_ts(in_time_base, out_time_base);
+        encoded.set_stream(out_vid_stream_idx);
+        encoded.rescale_ts(in_vid_tb, out_vid_tb);
         encoded.write_interleaved(out_ctx).unwrap();
     } 
 }
@@ -138,6 +134,12 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
     (glyphs_width, glyph_bytes)
 }
 
+// Input is assumed to have only one video stream
+// Font used may by ttf or otf
+// Destination format is only known to support .mp4
+// Codec is H.264
+// Pixel format is YUV420p
+
 fn main() {
     let src = "src.mp4";
     let dst = "dst.mp4";
@@ -153,13 +155,13 @@ fn main() {
     let mut in_ctx = format::input(src).unwrap();
 
     // Finds video stream
-    let in_stream = in_ctx.streams().best(ffmpeg_the_third::media::Type::Video)
+    let in_vid_stream = in_ctx.streams().best(media::Type::Video)
         .expect("Could not find a proper video stream");
-    let in_stream_index = in_stream.index();
-    let in_time_base = in_stream.time_base();
-    
+    let in_vid_stream_idx = in_vid_stream.index();
+    let in_vid_tb = in_vid_stream.time_base();
+
     // Creates decoder
-    let decoder_ctx = codec::Context::from_parameters(in_stream.parameters()).unwrap();
+    let decoder_ctx = codec::Context::from_parameters(in_vid_stream.parameters()).unwrap();
     let mut decoder = decoder_ctx.decoder().video().unwrap();
     if decoder.format() != Pixel::YUV420P {
         panic!("Pixel format is not YUV420P");
@@ -184,9 +186,9 @@ fn main() {
 
     // Creates output stream
     let codec = encoder::find(codec::Id::H264).expect("Couldn't find encoding codec");
-    let mut out_stream = out_ctx.add_stream(codec).expect("Couldn't create output stream");
-    out_stream.set_time_base(in_time_base);
-    let out_stream_index = out_stream.index();
+    let mut out_vid_stream = out_ctx.add_stream(codec).expect("Couldn't create output stream");
+    out_vid_stream.set_time_base(in_vid_tb);
+    let out_vid_stream_idx = out_vid_stream.index();
 
     // Creates encoder
     println!("{}, {}",dst_w, dst_h);
@@ -196,10 +198,9 @@ fn main() {
     encoder.set_height(dst_h);
     encoder.set_aspect_ratio(decoder.aspect_ratio());
     encoder.set_format(Pixel::YUV420P);
-    encoder.set_frame_rate(Some(in_stream.avg_frame_rate()));
-    encoder.set_time_base(in_time_base);
+    encoder.set_frame_rate(Some(in_vid_stream.avg_frame_rate()));
+    encoder.set_time_base(in_vid_tb);
     encoder.set_bit_rate(25000000);
-    encoder.set_max_bit_rate(50000000);
     
     if global_header {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
@@ -208,10 +209,39 @@ fn main() {
     let mut encoder = encoder
         .open()
         .expect("error opening x264 with supplied settings");
-    out_stream.set_parameters(Parameters::from(&encoder));
+    out_vid_stream.set_parameters(Parameters::from(&encoder));
     
     let dst_fmt = encoder.format();
-    let out_time_base = out_stream.time_base();
+    let out_vid_tb = out_vid_stream.time_base();
+
+    // Adds other non-video streams
+    let mut stream_mapping: Vec<isize> = vec![0; in_ctx.nb_streams() as _];
+    let mut in_stream_tbs = vec![Rational(0, 0); in_ctx.nb_streams() as _];
+    let mut out_stream_tbs = vec![Rational(0, 0); in_ctx.nb_streams() as _];
+    let mut out_stream_idx = 0;
+    for (stream_idx, in_stream) in in_ctx.streams().enumerate() {
+        let media = in_stream.parameters().medium();
+        if stream_idx == in_vid_stream_idx {
+            // Only for video stream
+            stream_mapping[stream_idx] = out_stream_idx;
+        } else if media == media::Type::Audio || media == media::Type::Subtitle {
+            // Creates copy streams for audio and subtitle streams
+            let mut out_stream = out_ctx.add_stream(encoder::find(codec::Id::None)).unwrap();
+            out_stream.set_parameters(in_stream.parameters());
+            unsafe {
+                (*out_stream.parameters_mut().as_mut_ptr()).codec_tag = 0;
+            }
+            out_stream.set_time_base(in_stream.time_base());
+            stream_mapping[stream_idx] = out_stream_idx;
+            in_stream_tbs[stream_idx] = in_stream.time_base();
+            out_stream_tbs[out_stream_idx as usize] = out_stream.time_base();
+        } else {
+            // Ignores other streams
+            stream_mapping[stream_idx] = -1;
+            continue;
+        }
+        out_stream_idx += 1;
+    }
 
     // Parses video
     let mut scaler = Context::get(
@@ -232,23 +262,35 @@ fn main() {
     let mut template = frame::Video::new(dst_fmt, dst_w, dst_h);
     template.data_mut(1).fill(127);
     template.data_mut(2).fill(127);
-    for (stream, packet) in in_ctx.packets().filter_map(Result::ok) {
-        if stream.index() == in_stream_index {
-            decoder.send_packet(&packet).unwrap();
+    for (stream, mut packet) in in_ctx.packets().filter_map(Result::ok) {
+        // Parses packets that don't have an out stream
+        let in_stream_idx = stream.index();
+        let out_stream_idx = stream_mapping[in_stream_idx];
+        if out_stream_idx < 0 {
+            continue;
         }
-        decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
-        encode_frames(&mut encoder, out_stream_index, in_time_base, out_time_base, &mut out_ctx);
+        if in_stream_idx == in_vid_stream_idx {
+            decoder.send_packet(&packet).unwrap();
+            decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
+            encode_frames(&mut encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, &mut out_ctx);
+        } else {
+            packet.rescale_ts(in_stream_tbs[in_stream_idx], out_stream_tbs[out_stream_idx as usize]);
+            packet.set_position(-1);
+            packet.set_duration(1);
+            packet.set_stream(out_stream_idx as usize);
+            packet.write_interleaved(&mut out_ctx).unwrap();
+        }
     }
 
     // Close file
     decoder.send_eof().unwrap();
     decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
     encoder.send_eof().unwrap();
-    encode_frames(&mut encoder, out_stream_index, in_time_base, out_time_base, &mut out_ctx);
+    encode_frames(&mut encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, &mut out_ctx);
     out_ctx.write_trailer().unwrap();
 
     // let audio_stream = input_context.streams().best(ffmpeg_next::media::Type::Audio).unwrap();
-    // let audio_stream_index = audio_stream.index();
+    // let audio_stream_idx = audio_stream.index();
 
     let elapsed_time = start_t.elapsed();
     println!("Took {} seconds.", elapsed_time.as_secs_f32());
