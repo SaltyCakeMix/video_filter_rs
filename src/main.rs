@@ -75,7 +75,7 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
     let font = Font::try_from_bytes(font_path).expect("Error constructing Font");
 
     // Determines proper font scaling
-    let value_cutoff = 0.25;
+    let value_cutoff = 0.5;
     let func = |height| {
         let scale = Scale::uniform(height);
         let v_metrics = font.v_metrics(scale);
@@ -108,13 +108,16 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
         (glyphs, glyphs_width, glyphs_height)
     };
     let (_, _, glyphs_height) = func(font_h as f32);
-    let adj_factor = font_h as f32 / glyphs_height as f32;
 
-    let (glyphs, glyphs_width, glyphs_height) = func(font_h as f32 * adj_factor);
-
+    let mut adj_font_h: f32 = font_h as f32 * font_h as f32 / glyphs_height as f32;
+    let (mut glyphs, mut glyphs_width, mut glyphs_height) = func(adj_font_h);
+    while glyphs_height > font_h {
+        adj_font_h *= font_h as f32 / glyphs_height as f32;
+        (glyphs, glyphs_width, glyphs_height) = func(adj_font_h);
+    }
     // Render characters
     let mut glyph_bytes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(glyphs.len());
-    let scale = Scale::uniform(font_h as f32 * adj_factor);
+    let scale = Scale::uniform(adj_font_h);
     let v_metrics = font.v_metrics(scale);
     for c in chars.chars() {
         let glyph = font.glyph(c).scaled(scale).positioned(point(0., v_metrics.ascent));
@@ -146,7 +149,7 @@ fn main() {
     let src = "src.mp4";
     let dst = "dst.mkv";
     let mut dst_h = 1080;
-    let render_h = 60;
+    let render_h = 59;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
     let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
 
@@ -210,13 +213,15 @@ fn main() {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
-    // let mut x264_opts = Dictionary::new();
+    let mut x264_opts = Dictionary::new();
     // x264_opts.set("profile", "100");
-    // x264_opts.set("preset", "veryslow");
-    // x264_opts.set("crf", "0");
+    // x264_opts.set("speed", "0");
+    // x264_opts.set("force-cfr", "1");
+
+    x264_opts.set("crf", "0");
 
     let mut encoder = encoder
-        .open()
+        .open_with(x264_opts)
         .expect("error opening x264 with supplied settings");
     out_vid_stream.set_parameters(Parameters::from(&encoder));
     
@@ -307,4 +312,3 @@ fn main() {
 }
 
 // fix compression issues
-// fix fps issue
