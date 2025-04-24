@@ -8,6 +8,8 @@ struct RenderData {
     _f_h: usize,
     r_w: usize,
     r_h: usize,
+    dst_w: u32,
+    dst_h: u32,
     x: Vec<usize>,
     y: Vec<usize>,
 }
@@ -19,43 +21,83 @@ impl RenderData {
             _f_h: f_h as usize,
             r_w: r_w as usize,
             r_h: r_h as usize,
+            dst_w,
+            dst_h,
             x: (0..r_w).map(|x| (x as f32 * dst_w as f32 / r_w as f32) as usize).collect(),
             y: (0..r_h).map(|x| (x as f32 * dst_h as f32 / r_h as f32) as usize).collect(),
         }
     }
 }
 
-fn decode_frames(decoder: &mut decoder::Video, encoder: &mut encoder::Video, scaler: &mut Context, char_set: &[Vec<Vec<u8>>], render_data: &RenderData, template: &frame::Video) {
-    let mut frame = frame::Video::empty();
-    let lum_to_char = char_set.len() as f32 / 256.;
-    while decoder.receive_frame(&mut frame).is_ok() {
-        // Scale frame to render resolution
-        let mut scaled_frame = frame::Video::new(Pixel::GRAY8, render_data.r_w as u32, render_data.r_h as u32);
-        scaler.run(&frame, &mut scaled_frame).unwrap();
-        let padding = scaled_frame.stride(0) - render_data.r_w;
-        let luminosity = scaled_frame.data_mut(0);
+struct Decoder<'a> {
+    decoder: decoder::Video,
+    scaler: Context,
+    char_set: &'a [Vec<Vec<u8>>],
+    frame: frame::Video,
+    last_frame: Vec<u8>,
+    render_data: RenderData,
+}
+impl<'a> Decoder<'a> {
+    fn new(decoder: decoder::Video, render_data: RenderData, scaler: Context, char_set: &'a [Vec<Vec<u8>>], dst_fmt: Pixel) -> Self {
+        let mut frame = frame::Video::new(dst_fmt, render_data.dst_w, render_data.dst_h);
+        frame.data_mut(1).fill(127);
+        frame.data_mut(2).fill(127);
+        let last_frame = frame::Video::new(Pixel::GRAY8, render_data.r_w as u32, render_data.r_h as u32).data(0).to_owned();
 
-        // Render characters on to output frame
-        let mut new_frame = template.clone();
-        let bytes = new_frame.data_mut(0);
-        let mut i = 0;
-        for y in render_data.y.iter() {
-            for x in render_data.x.iter() {
-                let char_idx = luminosity[i] as f32 * lum_to_char;
-                let stamp = &char_set[char_idx as usize];
-
-                let mut start = x + y*template.stride(0);
-                for line in stamp {
-                    bytes[start..(start + render_data.f_w)].copy_from_slice(line);
-                    start += template.stride(0);
-                }
-                i += 1;
-            }
-            i+= padding;
+        Self {
+            decoder,
+            scaler,
+            char_set,
+            frame,
+            last_frame,
+            render_data,
         }
+    }
 
-        new_frame.set_pts(frame.timestamp());
-        encoder.send_frame(&new_frame).unwrap();
+    fn decode_frames(&mut self, encoder: &mut encoder::Video)  {
+        let mut frame = frame::Video::empty();
+        let lum_to_char = self.char_set.len() as f32 / 256.;
+        while self.decoder.receive_frame(&mut frame).is_ok() {
+            // Scale frame to render resolution
+            let mut scaled_frame = frame::Video::new(Pixel::GRAY8, self.render_data.r_w as u32, self.render_data.r_h as u32);
+            self.scaler.run(&frame, &mut scaled_frame).unwrap();
+            let padding = scaled_frame.stride(0) - self.render_data.r_w;
+            let luminosity = scaled_frame.data_mut(0);
+
+            // Render characters on to output frame
+            let stride = self.frame.stride(0);
+            let bytes = self.frame.data_mut(0);
+            let mut i = 0;
+            let char_indices = luminosity.iter().map(|x| (*x as f32 * lum_to_char) as u8).collect::<Vec<u8>>();
+            for y in self.render_data.y.iter() {
+                for x in self.render_data.x.iter() {
+                    if char_indices[i] != self.last_frame[i] {
+                        let stamp = &self.char_set[char_indices[i] as usize];
+
+                        let mut start = x + y*stride;
+                        for line in stamp {
+                            bytes[start..(start + self.render_data.f_w)].copy_from_slice(line);
+                            start += stride;
+                        }
+                    }
+                    i += 1;
+                }
+                i+= padding;
+            }
+
+            self.last_frame = char_indices;
+            self.frame.set_pts(frame.timestamp());
+            encoder.send_frame(&self.frame).unwrap();
+        }
+    }
+
+    fn send_packet<T: packet::Ref>(&mut self, packet: T) {
+        self.decoder.send_packet(&packet).unwrap()
+    }
+    
+    fn end(&mut self, encoder: &mut encoder::Video) {
+        self.decoder.send_eof().unwrap();
+        self.decode_frames(encoder);
     }
 }
 
@@ -67,7 +109,7 @@ fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid
         encoded.set_flags(packet::Flags::from_bits(AV_PKT_FLAG_KEY).unwrap());
         encoded.write_interleaved(out_ctx).unwrap();
         *frame_ct += 1;
-    } 
+    }
 }
 
 fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<Vec<Vec<u8>>>) {
@@ -75,7 +117,7 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
     let font = Font::try_from_bytes(font_path).expect("Error constructing Font");
 
     // Determines proper font scaling
-    let value_cutoff = 0.5;
+    let value_cutoff = 0.25;
     let func = |height| {
         let scale = Scale::uniform(height);
         let v_metrics = font.v_metrics(scale);
@@ -147,9 +189,9 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 
 fn main() {
     let src = "src.mp4";
-    let dst = "dst.mkv";
+    let dst = "dst.mp4";
     let mut dst_h = 1080;
-    let render_h = 59;
+    let render_h = 60;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
     let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
 
@@ -159,7 +201,7 @@ fn main() {
     let is_mkv = dst.ends_with(".mkv");
 
     // Input
-    let mut in_ctx = format::input(src).unwrap();
+    let mut in_ctx = format::input(format!("./input/{src}")).unwrap();
 
     // Finds video stream
     let in_vid_stream = in_ctx.streams().best(media::Type::Video)
@@ -169,10 +211,15 @@ fn main() {
 
     // Creates decoder
     let decoder_ctx = codec::Context::from_parameters(in_vid_stream.parameters()).unwrap();
-    let mut decoder = decoder_ctx.decoder().video().unwrap();
+    let decoder = decoder_ctx.decoder().video().unwrap();
+
+    // Check inputs
     if decoder.format() != Pixel::YUV420P {
         panic!("Pixel format is not YUV420P");
-    };
+    }
+    if render_h == 0 {
+        panic!("render_h must be greater than 0");
+    }
 
     // Relevant data
     let src_w = decoder.width();
@@ -188,7 +235,7 @@ fn main() {
     let render_w = dst_w / font_w;
 
     // Output
-    let mut out_ctx = format::output(dst).unwrap();
+    let mut out_ctx = format::output(format!("./output/{dst}")).unwrap();
     let global_header = out_ctx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
     // Creates output stream
@@ -214,17 +261,14 @@ fn main() {
     }
 
     let mut x264_opts = Dictionary::new();
-    // x264_opts.set("profile", "100");
-    // x264_opts.set("speed", "0");
-    // x264_opts.set("force-cfr", "1");
-
     x264_opts.set("crf", "0");
+    x264_opts.set("preset", "veryslow");
 
     let mut encoder = encoder
-        .open_with(x264_opts)
+        .open()
         .expect("error opening x264 with supplied settings");
     out_vid_stream.set_parameters(Parameters::from(&encoder));
-    
+
     let dst_fmt = encoder.format();
 
     // Adds other non-video streams
@@ -256,21 +300,19 @@ fn main() {
     }
 
     // Parses video
-    let mut scaler = Context::get(
+    out_ctx.set_metadata(in_ctx.metadata().to_owned());
+    out_ctx.write_header().unwrap();
+    
+    let scaler = Context::get(
         src_fmt,
         src_w, src_h,
         Pixel::GRAY8,
         render_w, render_h,
         Flags::FAST_BILINEAR,
     ).unwrap();
-
-    out_ctx.set_metadata(in_ctx.metadata().to_owned());
-    out_ctx.write_header().unwrap();
-    
     let render_data = RenderData::new(render_w, render_h, dst_w, dst_h, font_w, font_h);
-    let mut template = frame::Video::new(dst_fmt, dst_w, dst_h);
-    template.data_mut(1).fill(127);
-    template.data_mut(2).fill(127);
+    let mut decoder = Decoder::new(decoder, render_data, scaler, &char_set, dst_fmt);
+
     let mut frame_ct = 0;
     let total_frames = in_vid_stream.frames();
     for (stream, mut packet) in in_ctx.packets().filter_map(Result::ok) {
@@ -282,8 +324,8 @@ fn main() {
         }
 
         if in_stream_idx == in_vid_stream_idx {
-            decoder.send_packet(&packet).unwrap();
-            decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
+            decoder.send_packet(packet);
+            decoder.decode_frames(&mut encoder);
             encode_frames(&mut encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, &mut out_ctx, &mut frame_ct);
         } else {
             packet.rescale_ts(in_stream_tbs[in_stream_idx], out_stream_tbs[out_stream_idx as usize]);
@@ -301,8 +343,7 @@ fn main() {
     }
 
     // Close file
-    decoder.send_eof().unwrap();
-    decode_frames(&mut decoder, &mut encoder, &mut scaler, &char_set, &render_data, &template);
+    decoder.end(&mut encoder);
     encoder.send_eof().unwrap();
     encode_frames(&mut encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, &mut out_ctx, &mut frame_ct);
     out_ctx.write_trailer().unwrap();
