@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_PKT_FLAG_KEY, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::{AV_PKT_FLAG_KEY, AV_TIME_BASE}, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Packet, Rational};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
@@ -33,23 +33,20 @@ struct Decoder<'a> {
     decoder: decoder::Video,
     scaler: Context,
     char_set: &'a [Vec<Vec<u8>>],
-    frame: frame::Video,
-    last_frame: Vec<u8>,
+    new_frame: frame::Video,
     render_data: RenderData,
 }
 impl<'a> Decoder<'a> {
     fn new(decoder: decoder::Video, render_data: RenderData, scaler: Context, char_set: &'a [Vec<Vec<u8>>], dst_fmt: Pixel) -> Self {
-        let mut frame = frame::Video::new(dst_fmt, render_data.dst_w, render_data.dst_h);
-        frame.data_mut(1).fill(127);
-        frame.data_mut(2).fill(127);
-        let last_frame = frame::Video::new(Pixel::GRAY8, render_data.r_w as u32, render_data.r_h as u32).data(0).to_owned();
+        let mut new_frame = frame::Video::new(dst_fmt, render_data.dst_w, render_data.dst_h);
+        new_frame.data_mut(1).fill(127);
+        new_frame.data_mut(2).fill(127);
 
         Self {
             decoder,
             scaler,
             char_set,
-            frame,
-            last_frame,
+            new_frame,
             render_data,
         }
     }
@@ -65,29 +62,26 @@ impl<'a> Decoder<'a> {
             let luminosity = scaled_frame.data_mut(0);
 
             // Render characters on to output frame
-            let stride = self.frame.stride(0);
-            let bytes = self.frame.data_mut(0);
+            let stride = self.new_frame.stride(0);
+            let bytes = self.new_frame.data_mut(0);
             let mut i = 0;
-            let char_indices = luminosity.iter().map(|x| (*x as f32 * lum_to_char) as u8).collect::<Vec<u8>>();
             for y in self.render_data.y.iter() {
                 for x in self.render_data.x.iter() {
-                    if char_indices[i] != self.last_frame[i] {
-                        let stamp = &self.char_set[char_indices[i] as usize];
+                    let char_idx = (luminosity[i] as f32 * lum_to_char) as usize;
+                    let stamp = &self.char_set[char_idx];
 
-                        let mut start = x + y*stride;
-                        for line in stamp {
-                            bytes[start..(start + self.render_data.f_w)].copy_from_slice(line);
-                            start += stride;
-                        }
+                    let mut start = x + y*stride;
+                    for line in stamp {
+                        bytes[start..(start + self.render_data.f_w)].copy_from_slice(line);
+                        start += stride;
                     }
                     i += 1;
                 }
                 i+= padding;
             }
 
-            self.last_frame = char_indices;
-            self.frame.set_pts(frame.timestamp());
-            encoder.send_frame(&self.frame).unwrap();
+            self.new_frame.set_pts(frame.timestamp());
+            encoder.send_frame(&self.new_frame).unwrap();
         }
     }
 
@@ -188,8 +182,8 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 // Pixel format is YUV420p
 
 fn main() {
-    let src = "src.mp4";
-    let dst = "dst.mp4";
+    let src = "cut.mkv";
+    let dst = "dst.mkv";
     let mut dst_h = 1080;
     let render_h = 60;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
@@ -214,12 +208,8 @@ fn main() {
     let decoder = decoder_ctx.decoder().video().unwrap();
 
     // Check inputs
-    if decoder.format() != Pixel::YUV420P {
-        panic!("Pixel format is not YUV420P");
-    }
-    if render_h == 0 {
-        panic!("render_h must be greater than 0");
-    }
+    assert!(decoder.format() == Pixel::YUV420P, "Pixel format is not YUV420P");
+    assert!(render_h != 0, "render_h must be greater than 0");
 
     // Relevant data
     let src_w = decoder.width();
@@ -259,10 +249,6 @@ fn main() {
     if global_header {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
-
-    let mut x264_opts = Dictionary::new();
-    x264_opts.set("crf", "0");
-    x264_opts.set("preset", "veryslow");
 
     let mut encoder = encoder
         .open()
@@ -314,7 +300,13 @@ fn main() {
     let mut decoder = Decoder::new(decoder, render_data, scaler, &char_set, dst_fmt);
 
     let mut frame_ct = 0;
-    let total_frames = in_vid_stream.frames();
+    let mut total_frames = in_vid_stream.frames();
+    if total_frames == 0 {
+        total_frames = in_ctx.duration()
+        / AV_TIME_BASE as i64
+        * in_vid_stream.avg_frame_rate().numerator() as i64
+        / in_vid_stream.avg_frame_rate().denominator() as i64;
+    }
     for (stream, mut packet) in in_ctx.packets().filter_map(Result::ok) {
         // Parses packets that don't have an out stream
         let in_stream_idx = stream.index();
@@ -349,7 +341,11 @@ fn main() {
     out_ctx.write_trailer().unwrap();
 
     let elapsed_time = start_t.elapsed();
-    println!("Took {} seconds.", elapsed_time.as_secs_f32());
+    println!("Took {} seconds for {} frames.", elapsed_time.as_secs_f32(), total_frames);
 }
 
 // fix compression issues
+// add multithreading
+// fix src mkv total frames
+// fix sub duration
+// fix sub names
