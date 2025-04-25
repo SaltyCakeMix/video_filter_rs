@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::{AV_PKT_FLAG_KEY, AV_TIME_BASE}, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Packet, Rational};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
@@ -100,7 +100,7 @@ fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid
     while encoder.receive_packet(&mut encoded).is_ok() {
         encoded.set_stream(out_vid_stream_idx);
         encoded.rescale_ts(in_vid_tb, out_vid_tb);
-        encoded.set_flags(packet::Flags::from_bits(AV_PKT_FLAG_KEY).unwrap());
+        encoded.set_flags(packet::Flags::KEY);
         encoded.write_interleaved(out_ctx).unwrap();
         *frame_ct += 1;
     }
@@ -182,7 +182,7 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 // Pixel format is YUV420p
 
 fn main() {
-    let src = "cut.mkv";
+    let src = "src.mp4";
     let dst = "dst.mkv";
     let mut dst_h = 1080;
     let render_h = 60;
@@ -285,10 +285,11 @@ fn main() {
         out_stream_idx += 1;
     }
 
-    // Parses video
+    // Write header
     out_ctx.set_metadata(in_ctx.metadata().to_owned());
     out_ctx.write_header().unwrap();
     
+    // Create transcoding data structures
     let scaler = Context::get(
         src_fmt,
         src_w, src_h,
@@ -299,6 +300,7 @@ fn main() {
     let render_data = RenderData::new(render_w, render_h, dst_w, dst_h, font_w, font_h);
     let mut decoder = Decoder::new(decoder, render_data, scaler, &char_set, dst_fmt);
 
+    // Get total frames
     let mut frame_ct = 0;
     let mut total_frames = in_vid_stream.frames();
     if total_frames == 0 {
@@ -307,6 +309,8 @@ fn main() {
         * in_vid_stream.avg_frame_rate().numerator() as i64
         / in_vid_stream.avg_frame_rate().denominator() as i64;
     }
+
+    // Parses video
     for (stream, mut packet) in in_ctx.packets().filter_map(Result::ok) {
         // Parses packets that don't have an out stream
         let in_stream_idx = stream.index();
@@ -322,7 +326,6 @@ fn main() {
         } else {
             packet.rescale_ts(in_stream_tbs[in_stream_idx], out_stream_tbs[out_stream_idx as usize]);
             packet.set_position(-1);
-            packet.set_duration(1); // not really sure if this is right
             packet.set_stream(out_stream_idx as usize);
             packet.write_interleaved(&mut out_ctx).unwrap();
         }
@@ -346,6 +349,4 @@ fn main() {
 
 // fix compression issues
 // add multithreading
-// fix src mkv total frames
-// fix sub duration
 // fix sub names
