@@ -10,5 +10,7 @@ opt-level = 1
 opt-level = 3
 
 [dependencies]
-ffmpeg-the-third = "3.0.1"
+ffmpeg-the-third = {version = "3.0.1", features = [
+    "static",
+]}
 rusttype = "0.9.3"

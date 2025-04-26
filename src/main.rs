@@ -181,14 +181,13 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 // Codec is H.264
 // Pixel format is YUV420p
 // Requires FFMPEG 5.x.x
-
 fn main() {
-    let src = "cut.mkv";
+    let src = "huh.mkv";
     let dst = "dst.mkv";
     let mut dst_h = 1080;
     let render_h = 60;
     let font_path = include_bytes!("../MonospaceTypewriter.ttf");
-    let char_set = " .-^:~/*+=?%##&$$@@@@@@@@@@@@";
+    let char_set = " .-:^~=/*+?%##&$$@@@@@@@@@@@@";
 
     let start_t = Instant::now();
     let mut last_t = Instant::now();
@@ -210,7 +209,6 @@ fn main() {
     let decoder = decoder_ctx.decoder().video().unwrap();
 
     // Check inputs
-    assert!(decoder.format() == Pixel::YUV420P, "Pixel format is not YUV420P");
     assert!(render_h != 0, "render_h must be greater than 0");
     if src_mkv && !dst_mkv {println!("Transcoding .mkv with subs to mp4 may have undefined behavior")};
 
@@ -253,12 +251,14 @@ fn main() {
     }
 
     let mut x264_opts = Dictionary::new();
-    x264_opts.set("crf", "18");
+    x264_opts.set("crf", "24");
+    x264_opts.set("g", "60");
 
     let mut encoder = encoder
         .open_with(x264_opts)
         .expect("error opening x264 with supplied settings");
     out_vid_stream.set_parameters(Parameters::from(&encoder));
+    out_vid_stream.set_metadata(in_vid_stream.metadata().to_owned());
 
     let dst_fmt = encoder.format();
 
@@ -272,10 +272,11 @@ fn main() {
         if stream_idx == in_vid_stream_idx {
             // Only for video stream
             stream_mapping[stream_idx] = out_stream_idx;
-        } else if media == media::Type::Audio || media == media::Type::Subtitle {
+        } else if media != media::Type::Video && media != media::Type::Unknown {
             // Creates copy streams for audio and subtitle streams
             let mut out_stream = out_ctx.add_stream(encoder::find(codec::Id::None)).unwrap();
             out_stream.set_parameters(in_stream.parameters());
+            out_stream.set_metadata(in_stream.metadata().to_owned());
             unsafe {
                 (*out_stream.parameters_mut().as_mut_ptr()).codec_tag = 0;
             }
@@ -291,8 +292,13 @@ fn main() {
     }
 
     // Write header
+    for chapter in in_ctx.chapters() {
+        if let Some(title) = chapter.metadata().get("title") {
+            out_ctx.add_chapter(chapter.id(), chapter.time_base(), chapter.start(), chapter.end(), title).expect("Could not add chapter");
+        }
+    }
     out_ctx.set_metadata(in_ctx.metadata().to_owned());
-    out_ctx.write_header().unwrap();
+    out_ctx.write_header().expect("Could not write header");
     
     // Create transcoding data structures
     let scaler = Context::get(
@@ -351,7 +357,3 @@ fn main() {
     let elapsed_time = start_t.elapsed();
     println!("Took {} seconds for {} frames.", elapsed_time.as_secs_f32(), total_frames);
 }
-
-// add multithreading
-// fix compatibility with yuv420p10le
-// fix sub names --> issue with metadata
