@@ -13,7 +13,6 @@ struct RenderData {
     x: Vec<usize>,
     y: Vec<usize>,
 }
-
 impl RenderData {
     fn new(r_w: u32, r_h: u32, dst_w: u32, dst_h: u32, f_w: u32, f_h: u32) -> Self {
         Self {
@@ -33,37 +32,39 @@ struct Decoder<'a> {
     decoder: decoder::Video,
     scaler: Context,
     char_set: &'a [Vec<Vec<u8>>],
-    new_frame: frame::Video,
+    in_frame: frame::Video,
+    scaled_frame: frame::Video,
+    out_frame: frame::Video,
     render_data: RenderData,
 }
 impl<'a> Decoder<'a> {
     fn new(decoder: decoder::Video, render_data: RenderData, scaler: Context, char_set: &'a [Vec<Vec<u8>>], dst_fmt: Pixel) -> Self {
-        let mut new_frame = frame::Video::new(dst_fmt, render_data.dst_w, render_data.dst_h);
-        new_frame.data_mut(1).fill(127);
-        new_frame.data_mut(2).fill(127);
+        let mut out_frame = frame::Video::new(dst_fmt, render_data.dst_w, render_data.dst_h);
+        out_frame.data_mut(1).fill(127);
+        out_frame.data_mut(2).fill(127);
 
         Self {
             decoder,
             scaler,
             char_set,
-            new_frame,
+            in_frame: frame::Video::empty(),
+            scaled_frame: frame::Video::new(Pixel::GRAY8, render_data.r_w as u32, render_data.r_h as u32),
+            out_frame,
             render_data,
         }
     }
 
     fn decode_frames(&mut self, encoder: &mut encoder::Video)  {
-        let mut frame = frame::Video::empty();
         let lum_to_char = self.char_set.len() as f32 / 256.;
-        while self.decoder.receive_frame(&mut frame).is_ok() {
+        while self.decoder.receive_frame(&mut self.in_frame).is_ok() {
             // Scale frame to render resolution
-            let mut scaled_frame = frame::Video::new(Pixel::GRAY8, self.render_data.r_w as u32, self.render_data.r_h as u32);
-            self.scaler.run(&frame, &mut scaled_frame).unwrap();
-            let padding = scaled_frame.stride(0) - self.render_data.r_w;
-            let luminosity = scaled_frame.data_mut(0);
+            self.scaler.run(&self.in_frame, &mut self.scaled_frame).unwrap();
+            let padding = self.scaled_frame.stride(0) - self.render_data.r_w;
+            let luminosity = self.scaled_frame.data_mut(0);
 
             // Render characters on to output frame
-            let stride = self.new_frame.stride(0);
-            let bytes = self.new_frame.data_mut(0);
+            let stride = self.out_frame.stride(0);
+            let bytes = self.out_frame.data_mut(0);
             let mut i = 0;
             for y in self.render_data.y.iter() {
                 for x in self.render_data.x.iter() {
@@ -80,8 +81,8 @@ impl<'a> Decoder<'a> {
                 i+= padding;
             }
 
-            self.new_frame.set_pts(frame.timestamp());
-            encoder.send_frame(&self.new_frame).unwrap();
+            self.out_frame.set_pts(self.in_frame.timestamp());
+            encoder.send_frame(&self.out_frame).unwrap();
         }
     }
 
@@ -182,7 +183,7 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 // Pixel format is YUV420p
 // Requires FFMPEG 5.x.x
 fn main() {
-    let src = "huh.mkv";
+    let src = "hnk.mp4";
     let dst = "dst.mkv";
     let mut dst_h = 1080;
     let render_h = 60;
