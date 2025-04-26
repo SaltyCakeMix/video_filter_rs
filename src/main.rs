@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
@@ -177,12 +177,13 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 
 // Input is assumed to have only one video stream
 // Font used may by ttf or otf
-// Destination format is only known to support .mp4
+// Destination format is only known to support .mp4 and .mkv
 // Codec is H.264
 // Pixel format is YUV420p
+// Requires FFMPEG 5.x.x
 
 fn main() {
-    let src = "src.mp4";
+    let src = "cut.mkv";
     let dst = "dst.mkv";
     let mut dst_h = 1080;
     let render_h = 60;
@@ -192,7 +193,8 @@ fn main() {
     let start_t = Instant::now();
     let mut last_t = Instant::now();
     ffmpeg_the_third::init().unwrap();
-    let is_mkv = dst.ends_with(".mkv");
+    let src_mkv = src.ends_with(".mkv");
+    let dst_mkv = dst.ends_with(".mkv");
 
     // Input
     let mut in_ctx = format::input(format!("./input/{src}")).unwrap();
@@ -210,6 +212,7 @@ fn main() {
     // Check inputs
     assert!(decoder.format() == Pixel::YUV420P, "Pixel format is not YUV420P");
     assert!(render_h != 0, "render_h must be greater than 0");
+    if src_mkv && !dst_mkv {println!("Transcoding .mkv with subs to mp4 may have undefined behavior")};
 
     // Relevant data
     let src_w = decoder.width();
@@ -231,7 +234,7 @@ fn main() {
     // Creates output stream
     let codec = encoder::find(codec::Id::H264).expect("Couldn't find encoding codec");
     let mut out_vid_stream = out_ctx.add_stream(codec).expect("Couldn't create output stream");
-    out_vid_stream.set_time_base(if is_mkv {Rational(1, 1000)} else {in_vid_tb});
+    out_vid_stream.set_time_base(if dst_mkv {Rational(1, 1000)} else {in_vid_tb});
     let out_vid_stream_idx = out_vid_stream.index();
     let out_vid_tb = out_vid_stream.time_base();
 
@@ -244,14 +247,16 @@ fn main() {
     encoder.set_format(Pixel::YUV420P);
     encoder.set_frame_rate(Some(in_vid_stream.avg_frame_rate()));
     encoder.set_time_base(in_vid_tb);
-    encoder.set_bit_rate(25000000);
     
     if global_header {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
+    let mut x264_opts = Dictionary::new();
+    x264_opts.set("crf", "18");
+
     let mut encoder = encoder
-        .open()
+        .open_with(x264_opts)
         .expect("error opening x264 with supplied settings");
     out_vid_stream.set_parameters(Parameters::from(&encoder));
 
@@ -274,7 +279,7 @@ fn main() {
             unsafe {
                 (*out_stream.parameters_mut().as_mut_ptr()).codec_tag = 0;
             }
-            out_stream_tbs[out_stream_idx as usize] = if is_mkv {Rational(1, 1000)} else {in_stream.time_base()};
+            out_stream_tbs[out_stream_idx as usize] = if dst_mkv {Rational(1, 1000)} else {in_stream.time_base()};
             in_stream_tbs[stream_idx] = in_stream.time_base();
             stream_mapping[stream_idx] = out_stream_idx;
         } else {
@@ -347,6 +352,6 @@ fn main() {
     println!("Took {} seconds for {} frames.", elapsed_time.as_secs_f32(), total_frames);
 }
 
-// fix compression issues
 // add multithreading
-// fix sub names
+// fix compatibility with yuv420p10le
+// fix sub names --> issue with metadata
