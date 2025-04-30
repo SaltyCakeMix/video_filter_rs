@@ -220,6 +220,10 @@ fn main() {
     let src_mkv = src.ends_with(".mkv");
     let dst_mkv = dst.ends_with(".mkv");
 
+    // Creates directories if they don't exist
+    let _ = std::fs::create_dir("./input");
+    let _ = std::fs::create_dir("./output");
+
     // Input
     let mut in_ctx = format::input(format!("./input/{src}")).unwrap();
 
