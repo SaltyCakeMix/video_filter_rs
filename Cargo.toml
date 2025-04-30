@@ -13,4 +13,5 @@ opt-level = 3
 ffmpeg-the-third = {version = "3.0.1", features = [
     "static",
 ]}
+rust-ini = "0.21.1"
 rusttype = "0.9.3"

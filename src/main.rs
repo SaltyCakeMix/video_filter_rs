@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ini::Ini;
 use rusttype::{point, Font, Scale};
 
 struct RenderData {
@@ -107,12 +108,12 @@ fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid
     }
 }
 
-fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<Vec<Vec<u8>>>) {
+fn construct_char_set(font_path: &str, chars: &str, font_h: u32, font_thickness: f32) -> (u32, Vec<Vec<Vec<u8>>>) {
     // Loads font
-    let font = Font::try_from_bytes(font_path).expect("Error constructing Font");
-
+    let font_data = std::fs::read(font_path).expect("Could not load font");
+    let font = Font::try_from_bytes(&font_data).expect("Could not construct font");
+ 
     // Determines proper font scaling
-    let value_cutoff = 0.25;
     let func = |height| {
         let scale = Scale::uniform(height);
         let v_metrics = font.v_metrics(scale);
@@ -132,7 +133,7 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
             let mut right = 0;
             for glyph in glyphs.iter() {
                 glyph.draw(|x, y, v| {
-                    if v > value_cutoff {
+                    if v > font_thickness {
                         top = y.min(top);
                         bottom = y.max(bottom);
                         left = x.min(left);
@@ -166,7 +167,7 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
                 let x_i = x as i32 + x_pad;
                 let y_i = y as i32 + y_pad;
                 if x > 0 && x < glyphs_width && y > 0 && y < glyphs_height {
-                    bytes[y_i as usize][x_i as usize] = (v > value_cutoff) as u8 * 255;
+                    bytes[y_i as usize][x_i as usize] = (v > font_thickness) as u8 * 255;
                 }
             });
         }
@@ -176,6 +177,26 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
     (glyphs_width, glyph_bytes)
 }
 
+fn load_settings() -> Ini {
+    if let Ok(ini) = Ini::load_from_file("settings.ini") {
+        return ini
+    }
+    let mut ini = Ini::new();
+    ini.with_section(None::<String>)
+        .set("src", "src.mp4")
+        .set("dst", "dst.mkv")
+        .set("dst_h", "1080")
+        .set("render_h", "60")
+        .set("font_path", "./MonospaceTypewriter.ttf")
+        .set("char_set", " .-:^~=/*+?%##&$$@@@@@@@@@@@@")
+        .set("font_thickness", "0.25");
+    ini.with_section(Some("libx264_options"))
+        .set("crf", "24")
+        .set("g", "60");
+    ini.write_to_file("settings.ini").expect("Could not create settings file");
+    ini
+}
+
 // Input is assumed to have only one video stream
 // Font used may by ttf or otf
 // Destination format is only known to support .mp4 and .mkv
@@ -183,12 +204,15 @@ fn construct_char_set(font_path: &[u8], chars: &str, font_h: u32) -> (u32, Vec<V
 // Pixel format is YUV420p
 // Requires FFMPEG 5.x.x
 fn main() {
-    let src = "hnk.mp4";
-    let dst = "dst.mkv";
-    let mut dst_h = 1080;
-    let render_h = 60;
-    let font_path = include_bytes!("../MonospaceTypewriter.ttf");
-    let char_set = " .-:^~=/*+?%##&$$@@@@@@@@@@@@";
+    let settings = load_settings();
+    let base_settings = settings.section(None::<String>).unwrap();
+    let src = base_settings.get("src").expect("No source file specified");
+    let dst = base_settings.get("dst").expect("No destination file specified");
+    let mut dst_h: u32 = base_settings.get("dst_h").expect("No destination height specified").parse().unwrap();
+    let render_h: u32 = base_settings.get("render_h").expect("No render height specified").parse().unwrap();
+    let font_path = base_settings.get("font_path").expect("No font path specified");
+    let char_set = base_settings.get("char_set").expect("No character set specified");
+    let font_thickness: f32 = base_settings.get("font_thickness").expect("No font thickness specified").parse().unwrap();
 
     let start_t = Instant::now();
     let mut last_t = Instant::now();
@@ -223,7 +247,7 @@ fn main() {
     let src_fmt = decoder.format();
     
     // Font
-    let (font_w, char_set) = construct_char_set(font_path, char_set, font_h);
+    let (font_w, char_set) = construct_char_set(font_path, char_set, font_h, font_thickness);
     let render_w = dst_w / font_w;
 
     // Output
@@ -252,8 +276,11 @@ fn main() {
     }
 
     let mut x264_opts = Dictionary::new();
-    x264_opts.set("crf", "24");
-    x264_opts.set("g", "60");
+    if let Some(libx264_options) = settings.section(Some("libx264_options")) {
+        for (key, val) in libx264_options {
+            x264_opts.set(key, val);
+        }
+    }
 
     let mut encoder = encoder
         .open_with(x264_opts)
