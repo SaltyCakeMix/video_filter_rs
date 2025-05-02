@@ -1,12 +1,11 @@
+use core::f32;
 use std::time::Instant;
 
 use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use ini::Ini;
-use rusttype::{point, Font, Scale};
+use ab_glyph::{Font, FontRef, ScaleFont};
 
 struct RenderData {
-    f_w: usize,
-    _f_h: usize,
     r_w: usize,
     r_h: usize,
     dst_w: u32,
@@ -15,10 +14,8 @@ struct RenderData {
     y: Vec<usize>,
 }
 impl RenderData {
-    fn new(r_w: u32, r_h: u32, dst_w: u32, dst_h: u32, f_w: u32, f_h: u32) -> Self {
+    fn new(r_w: u32, r_h: u32, dst_w: u32, dst_h: u32) -> Self {
         Self {
-            f_w: f_w as usize,
-            _f_h: f_h as usize,
             r_w: r_w as usize,
             r_h: r_h as usize,
             dst_w,
@@ -74,7 +71,7 @@ impl<'a> Decoder<'a> {
 
                     let mut start = x + y*stride;
                     for line in stamp {
-                        bytes[start..(start + self.render_data.f_w)].copy_from_slice(line);
+                        bytes[start..(start + line.len())].copy_from_slice(line);
                         start += stride;
                     }
                     i += 1;
@@ -111,62 +108,56 @@ fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid
 fn construct_char_set(font_path: &str, chars: &str, font_h: u32, font_thickness: f32) -> (u32, Vec<Vec<Vec<u8>>>) {
     // Loads font
     let font_data = std::fs::read(font_path).expect("Could not load font");
-    let font = Font::try_from_bytes(&font_data).expect("Could not construct font");
+    let font = FontRef::try_from_slice(&font_data).expect("Could not construct font");
  
     // Determines proper font scaling
     let func = |height| {
-        let scale = Scale::uniform(height);
-        let v_metrics = font.v_metrics(scale);
-        let glyphs: Vec<_> = font.layout(chars, scale, point(0., v_metrics.ascent)).collect();
-        let (glyphs_width, glyphs_height) = {
-            let mut top = glyphs
-                .iter()
-                .map(|g| g.pixel_bounding_box().unwrap_or_default().height())
-                .max()
-                .unwrap() as u32;
-            let mut left = glyphs
-                .iter()
-                .map(|g| g.pixel_bounding_box().unwrap_or_default().width())
-                .max()
-                .unwrap() as u32;
-            let mut bottom = 0;
-            let mut right = 0;
-            for glyph in glyphs.iter() {
-                glyph.draw(|x, y, v| {
-                    if v > font_thickness {
-                        top = y.min(top);
-                        bottom = y.max(bottom);
-                        left = x.min(left);
-                        right = x.max(right);
-                    }
-                });
-            }
-            (right - left, bottom - top)
-        };
-        (glyphs, glyphs_width, glyphs_height)
+        let scaled_font = font.as_scaled(height);
+        let glyphs: Vec<_> = chars.chars().map(|x| scaled_font.outline_glyph(scaled_font.scaled_glyph(x))).collect();
+        let mut top = glyphs
+            .iter()
+            .map(|g| if let Some(g) = g {g.px_bounds().height()} else {0.})
+            .fold(f32::NAN, f32::max) as u32;
+        let mut left = glyphs
+            .iter()
+            .map(|g| if let Some(g) = g {g.px_bounds().width()} else {0.})
+            .fold(f32::NAN, f32::max) as u32;
+        let mut bottom = 0;
+        let mut right = 0;
+        for glyph in glyphs.iter().flatten() {
+            glyph.draw(|x, y, v| {
+                if v > font_thickness {
+                    top = y.min(top);
+                    bottom = y.max(bottom);
+                    left = x.min(left);
+                    right = x.max(right);
+                }
+            });
+        }
+        (glyphs, right - left, bottom - top)
     };
     let (_, _, glyphs_height) = func(font_h as f32);
 
     let mut adj_font_h: f32 = font_h as f32 * font_h as f32 / glyphs_height as f32;
     let (mut glyphs, mut glyphs_width, mut glyphs_height) = func(adj_font_h);
+
     while glyphs_height > font_h {
         adj_font_h *= font_h as f32 / glyphs_height as f32;
         (glyphs, glyphs_width, glyphs_height) = func(adj_font_h);
     }
+
     // Render characters
     let mut glyph_bytes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(glyphs.len());
-    let scale = Scale::uniform(adj_font_h);
-    let v_metrics = font.v_metrics(scale);
-    for c in chars.chars() {
-        let glyph = font.glyph(c).scaled(scale).positioned(point(0., v_metrics.ascent));
+    for glyph in glyphs {
         let mut bytes = vec![vec![0; glyphs_width as usize]; glyphs_height as usize];
-        if let Some(bounding_box) = glyph.pixel_bounding_box() {
-            let x_pad = (glyphs_width as i32 - bounding_box.width()) >> 1;
-            let y_pad = (glyphs_height as i32 - bounding_box.height()) >> 1;
-            glyph.draw(|x, y, v| {
-                let x_i = x as i32 + x_pad;
-                let y_i = y as i32 + y_pad;
-                if x > 0 && x < glyphs_width && y > 0 && y < glyphs_height {
+        if let Some(g) = glyph {
+            let bounding_box = g.px_bounds();
+            let x_pad = (glyphs_width as f32 - bounding_box.width()) / 2.;
+            let y_pad = (glyphs_height as f32 - bounding_box.height()) / 2.;
+            g.draw(|x, y, v| {
+                let x_i = x as f32 + x_pad;
+                let y_i = y as f32 + y_pad;
+                if (x_i as u32) < glyphs_width && (y_i as u32) < glyphs_height {
                     bytes[y_i as usize][x_i as usize] = (v > font_thickness) as u8 * 255;
                 }
             });
@@ -188,7 +179,7 @@ fn load_settings() -> Ini {
         .set("dst_h", "1080")
         .set("render_h", "60")
         .set("font_path", "./MonospaceTypewriter.ttf")
-        .set("char_set", " .-:^~=/*+?%##&$$@@@@@@@@@@@@")
+        .set("char_set", "space.-:^~=/*+?%##&$$@@@@@@@@@@@@")
         .set("font_thickness", "0.25");
     ini.with_section(Some("libx264_options"))
         .set("crf", "24")
@@ -211,7 +202,7 @@ fn main() {
     let mut dst_h: u32 = base_settings.get("dst_h").expect("No destination height specified").parse().unwrap();
     let render_h: u32 = base_settings.get("render_h").expect("No render height specified").parse().unwrap();
     let font_path = base_settings.get("font_path").expect("No font path specified");
-    let char_set = base_settings.get("char_set").expect("No character set specified");
+    let char_set = base_settings.get("char_set").expect("No character set specified").replace("space", " ");
     let font_thickness: f32 = base_settings.get("font_thickness").expect("No font thickness specified").parse().unwrap();
 
     let start_t = Instant::now();
@@ -251,7 +242,7 @@ fn main() {
     let src_fmt = decoder.format();
     
     // Font
-    let (font_w, char_set) = construct_char_set(font_path, char_set, font_h, font_thickness);
+    let (font_w, char_set) = construct_char_set(font_path, &char_set, font_h, font_thickness);
     let render_w = dst_w / font_w;
 
     // Output
@@ -340,7 +331,7 @@ fn main() {
         render_w, render_h,
         Flags::FAST_BILINEAR,
     ).unwrap();
-    let render_data = RenderData::new(render_w, render_h, dst_w, dst_h, font_w, font_h);
+    let render_data = RenderData::new(render_w, render_h, dst_w, dst_h);
     let mut decoder = Decoder::new(decoder, render_data, scaler, &char_set, dst_fmt);
 
     // Get total frames
