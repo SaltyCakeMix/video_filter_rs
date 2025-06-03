@@ -1,7 +1,7 @@
 use core::f32;
 use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, packet, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use ini::Ini;
 use ab_glyph::{Font, FontRef, ScaleFont};
 
@@ -76,15 +76,14 @@ impl<'a> Decoder<'a> {
                     }
                     i += 1;
                 }
-                i+= padding;
+                i += padding;
             }
-
             self.out_frame.set_pts(self.in_frame.timestamp());
             encoder.send_frame(&self.out_frame).unwrap();
         }
     }
 
-    fn send_packet<T: packet::Ref>(&mut self, packet: T) {
+    fn send_packet(&mut self, packet: Packet) {
         self.decoder.send_packet(&packet).unwrap()
     }
     
@@ -99,7 +98,6 @@ fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid
     while encoder.receive_packet(&mut encoded).is_ok() {
         encoded.set_stream(out_vid_stream_idx);
         encoded.rescale_ts(in_vid_tb, out_vid_tb);
-        encoded.set_flags(packet::Flags::KEY);
         encoded.write_interleaved(out_ctx).unwrap();
         *frame_ct += 1;
     }
@@ -179,11 +177,10 @@ fn load_settings() -> Ini {
         .set("dst_h", "1080")
         .set("render_h", "60")
         .set("font_path", "./MonospaceTypewriter.ttf")
-        .set("char_set", "space.-:^~=/*+?%##&$$@@@@@@@@@@@@")
+        .set("char_set", "space.-^~:/*=+?%##&$$@@@@@@@@@@@@")
         .set("font_thickness", "0.25");
     ini.with_section(Some("libx264_options"))
-        .set("crf", "24")
-        .set("g", "60");
+        .set("crf", "24");
     ini.write_to_file("settings.ini").expect("Could not create settings file");
     ini
 }
@@ -193,7 +190,7 @@ fn load_settings() -> Ini {
 // Destination format is only known to support .mp4 and .mkv
 // Codec is H.264
 // Pixel format is YUV420p
-// Requires FFMPEG 5.x.x
+// Requires FFMPEG 5.x.x to build
 fn main() {
     let settings = load_settings();
     let base_settings = settings.section(None::<String>).unwrap();
@@ -286,17 +283,18 @@ fn main() {
     let dst_fmt = encoder.format();
 
     // Adds other non-video streams
-    let mut stream_mapping: Vec<isize> = vec![0; in_ctx.nb_streams() as _];
-    let mut in_stream_tbs = vec![Rational(0, 0); in_ctx.nb_streams() as _];
-    let mut out_stream_tbs = vec![Rational(0, 0); in_ctx.nb_streams() as _];
+    let mut stream_mapping = vec![-1; in_ctx.nb_streams() as _];
+    let mut in_stream_tbs = vec![Rational(0, 1); in_ctx.nb_streams() as _];
+    let mut out_stream_tbs = vec![Rational(0, 1); in_ctx.nb_streams() as _];
     let mut out_stream_idx = 0;
     for (stream_idx, in_stream) in in_ctx.streams().enumerate() {
         let media = in_stream.parameters().medium();
         if stream_idx == in_vid_stream_idx {
             // Only for video stream
             stream_mapping[stream_idx] = out_stream_idx;
+            out_stream_idx += 1;
         } else if media != media::Type::Video && media != media::Type::Unknown {
-            // Creates copy streams for audio and subtitle streams
+            // Creates copy of other streams
             let mut out_stream = out_ctx.add_stream(encoder::find(codec::Id::None)).unwrap();
             out_stream.set_parameters(in_stream.parameters());
             out_stream.set_metadata(in_stream.metadata().to_owned());
@@ -306,12 +304,8 @@ fn main() {
             out_stream_tbs[out_stream_idx as usize] = if dst_mkv {Rational(1, 1000)} else {in_stream.time_base()};
             in_stream_tbs[stream_idx] = in_stream.time_base();
             stream_mapping[stream_idx] = out_stream_idx;
-        } else {
-            // Ignores other streams
-            stream_mapping[stream_idx] = -1;
-            continue;
+            out_stream_idx += 1;
         }
-        out_stream_idx += 1;
     }
 
     // Write header
