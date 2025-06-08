@@ -1,7 +1,7 @@
 use core::f32;
-use std::{collections::HashMap, process::exit, time::Instant};
+use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::{av_opt_set, AV_TIME_BASE}, format::{self, Pixel}, frame, log, media, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use ini::Ini;
 use ab_glyph::{Font, FontRef, ScaleFont};
 
@@ -83,8 +83,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn send_packet(&mut self, packet: Packet, buffer: &mut DataBuffer) {
-        buffer.0.insert(packet.pts(), (packet.dts(), packet.duration(), packet.position()));
+    fn send_packet(&mut self, packet: Packet) {
         self.decoder.send_packet(&packet).unwrap()
     }
     
@@ -94,60 +93,15 @@ impl<'a> Decoder<'a> {
     }
 }
 
-#[derive(Default)]
-struct DataBuffer(HashMap<Option<i64>, (Option<i64>, i64, isize)>);
-
-struct Encoder {
-    encoder: encoder::Video,
-    data_buffer: DataBuffer,
-    frame_buffer: Vec<Packet>,
-    out_vid_stream_idx: usize,
-    in_vid_tb: Rational,
-    out_vid_tb: Rational,
-    out_ctx: format::context::Output,
-    frame_ct: u32,
-}
-impl Encoder {
-    fn new(encoder: encoder::Video, out_vid_stream_idx: usize, in_vid_tb: Rational, out_vid_tb: Rational, out_ctx: format::context::Output) -> Self {
-        Encoder {
-            encoder,
-            data_buffer: DataBuffer::default(),
-            frame_buffer: Vec::with_capacity(30),
-            out_vid_stream_idx,
-            in_vid_tb,
-            out_vid_tb,
-            out_ctx,
-            frame_ct: 0}
-    }
-
-    fn encode_frames(&mut self) {
-        let mut encoded = Packet::empty();
-        while self.encoder.receive_packet(&mut encoded).is_ok() {
-            let (dts, duration, position) = self.data_buffer.0.remove(&encoded.pts()).unwrap();
-            encoded.set_duration(duration);
-            encoded.set_position(position);
-            // encoded.set_dts(encoded.pts());
-            encoded.set_stream(self.out_vid_stream_idx);
-            encoded.rescale_ts(self.in_vid_tb, self.out_vid_tb);
-
-            let index = self.frame_buffer.partition_point(|x| x.pts() > encoded.pts());
-            // self.frame_buffer.insert(index, encoded.clone());
-            encoded.write_interleaved(&mut self.out_ctx).unwrap();
-            self.frame_ct += 1;
-        }
-
-        // while self.frame_buffer.len() > 30 {
-        //     self.frame_buffer.pop().unwrap().write(&mut self.out_ctx).unwrap();
-        // }
-    }
-
-    fn flush(&mut self) {
-        while let Some(packet) = self.frame_buffer.pop() {
-            packet.write(&mut self.out_ctx).unwrap();
-        }
+fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid_tb: Rational, out_vid_tb: Rational, out_ctx: &mut format::context::Output, frame_ct: &mut u32) {
+    let mut encoded = Packet::empty();
+    while encoder.receive_packet(&mut encoded).is_ok() {
+        encoded.set_stream(out_vid_stream_idx);
+        encoded.rescale_ts(in_vid_tb, out_vid_tb);
+        encoded.write_interleaved(out_ctx).unwrap();
+        *frame_ct += 1;
     }
 }
-
 
 fn construct_char_set(font_path: &str, chars: &str, font_h: u32, font_thickness: f32) -> (u32, Vec<Vec<Vec<u8>>>) {
     // Loads font
@@ -238,7 +192,6 @@ fn load_settings() -> Ini {
 // Pixel format is YUV420p
 // Requires FFMPEG 5.x.x to build
 fn main() {
-    // log::set_level(log::Level::Debug);
     let settings = load_settings();
     let base_settings = settings.section(None::<String>).unwrap();
     let src = base_settings.get("src").expect("No source file specified");
@@ -290,14 +243,7 @@ fn main() {
     let render_w = dst_w / font_w;
 
     // Output
-    let mut format_opts = Dictionary::new();
-    if let Some(options) = settings.section(Some("format_options")) {
-        for (key, val) in options {
-            format_opts.set(key, val);
-        }
-    }
-
-    let mut out_ctx = format::output_with(format!("./output/{dst}"), format_opts).unwrap();
+    let mut out_ctx = format::output(format!("./output/{dst}")).unwrap();
     let global_header = out_ctx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
     // Creates output stream
@@ -322,17 +268,18 @@ fn main() {
     }
 
     let mut x264_opts = Dictionary::new();
-    if let Some(options) = settings.section(Some("libx264_options")) {
-        for (key, val) in options {
+    if let Some(libx264_options) = settings.section(Some("libx264_options")) {
+        for (key, val) in libx264_options {
             x264_opts.set(key, val);
         }
     }
 
-    let encoder = encoder
+    let mut encoder = encoder
         .open_with(x264_opts)
         .expect("error opening x264 with supplied settings");
     out_vid_stream.set_parameters(Parameters::from(&encoder));
     out_vid_stream.set_metadata(in_vid_stream.metadata().to_owned());
+
     let dst_fmt = encoder.format();
 
     // Adds other non-video streams
@@ -380,9 +327,9 @@ fn main() {
     ).unwrap();
     let render_data = RenderData::new(render_w, render_h, dst_w, dst_h);
     let mut decoder = Decoder::new(decoder, render_data, scaler, &char_set, dst_fmt);
-    let mut encoder = Encoder::new(encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, out_ctx);
 
     // Get total frames
+    let mut frame_ct = 0;
     let mut total_frames = in_vid_stream.frames();
     if total_frames == 0 {
         total_frames = in_ctx.duration()
@@ -401,34 +348,29 @@ fn main() {
         }
 
         if in_stream_idx == in_vid_stream_idx {
-            decoder.send_packet(packet, &mut encoder.data_buffer);
-            decoder.decode_frames(&mut encoder.encoder);
-            encoder.encode_frames();
+            decoder.send_packet(packet);
+            decoder.decode_frames(&mut encoder);
+            encode_frames(&mut encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, &mut out_ctx, &mut frame_ct);
         } else {
             packet.rescale_ts(in_stream_tbs[in_stream_idx], out_stream_tbs[out_stream_idx as usize]);
             packet.set_position(-1);
             packet.set_stream(out_stream_idx as usize);
-            packet.write_interleaved(&mut encoder.out_ctx).unwrap();
+            packet.write_interleaved(&mut out_ctx).unwrap();
         }
 
         // Logging
         if Instant::now().duration_since(last_t).as_secs_f32() > 5. {
-            println!("{}/{} frames processed", encoder.frame_ct, total_frames);
+            println!("{}/{} frames processed", frame_ct, total_frames);
             last_t = Instant::now();
         }
     }
 
     // Close file
-    decoder.end(&mut encoder.encoder);
-    encoder.encoder.send_eof().unwrap();
-    encoder.encode_frames();
-    encoder.flush();
-    encoder.out_ctx.write_trailer().unwrap();
+    decoder.end(&mut encoder);
+    encoder.send_eof().unwrap();
+    encode_frames(&mut encoder, out_vid_stream_idx, in_vid_tb, out_vid_tb, &mut out_ctx, &mut frame_ct);
+    out_ctx.write_trailer().unwrap();
 
     let elapsed_time = start_t.elapsed();
     println!("Took {} seconds for {} frames.", elapsed_time.as_secs_f32(), total_frames);
 }
-
-// fix first dts N/A for mkv
-// fix seek bar for mkv
-// allow mkv -> mp4
