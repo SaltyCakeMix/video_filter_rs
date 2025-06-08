@@ -1,7 +1,7 @@
 use core::f32;
 use std::time::Instant;
 
-use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::AV_TIME_BASE, format::{self, Pixel}, frame, media, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
+use ffmpeg_the_third::{codec::{self, Parameters}, decoder, encoder, ffi::{avformat_query_codec, AV_TIME_BASE, FF_COMPLIANCE_NORMAL}, format::{self, Pixel}, frame, media, software::scaling::{Context, Flags}, Dictionary, Packet, Rational};
 use ini::Ini;
 use ab_glyph::{Font, FontRef, ScaleFont};
 
@@ -96,8 +96,8 @@ impl<'a> Decoder<'a> {
 fn encode_frames(encoder: &mut encoder::Video, out_vid_stream_idx: usize, in_vid_tb: Rational, out_vid_tb: Rational, out_ctx: &mut format::context::Output, frame_ct: &mut u32) {
     let mut encoded = Packet::empty();
     while encoder.receive_packet(&mut encoded).is_ok() {
-        encoded.set_stream(out_vid_stream_idx);
         encoded.rescale_ts(in_vid_tb, out_vid_tb);
+        encoded.set_stream(out_vid_stream_idx);
         encoded.write_interleaved(out_ctx).unwrap();
         *frame_ct += 1;
     }
@@ -249,7 +249,7 @@ fn main() {
     // Creates output stream
     let codec = encoder::find(codec::Id::H264).expect("Couldn't find encoding codec");
     let mut out_vid_stream = out_ctx.add_stream(codec).expect("Couldn't create output stream");
-    out_vid_stream.set_time_base(if dst_mkv {Rational(1, 1000)} else {in_vid_tb});
+    out_vid_stream.set_time_base(if dst_mkv {Rational(1, 1000)} else {Rational(1, 15360)});
     let out_vid_stream_idx = out_vid_stream.index();
     let out_vid_tb = out_vid_stream.time_base();
 
@@ -268,8 +268,8 @@ fn main() {
     }
 
     let mut x264_opts = Dictionary::new();
-    if let Some(libx264_options) = settings.section(Some("libx264_options")) {
-        for (key, val) in libx264_options {
+    if let Some(options) = settings.section(Some("libx264_options")) {
+        for (key, val) in options {
             x264_opts.set(key, val);
         }
     }
@@ -293,7 +293,10 @@ fn main() {
             // Only for video stream
             stream_mapping[stream_idx] = out_stream_idx;
             out_stream_idx += 1;
-        } else if media != media::Type::Video && media != media::Type::Unknown {
+        } else if media != media::Type::Video && media != media::Type::Unknown &&
+            unsafe {
+                avformat_query_codec(out_ctx.format().as_ptr(), (*in_stream.parameters().as_ptr()).codec_id, FF_COMPLIANCE_NORMAL)
+            } == 1 {
             // Creates copy of other streams
             let mut out_stream = out_ctx.add_stream(encoder::find(codec::Id::None)).unwrap();
             out_stream.set_parameters(in_stream.parameters());
@@ -374,3 +377,5 @@ fn main() {
     let elapsed_time = start_t.elapsed();
     println!("Took {} seconds for {} frames.", elapsed_time.as_secs_f32(), total_frames);
 }
+// fix first dts N/A for mkv
+// fix seek bar for mkv
